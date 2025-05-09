@@ -1,7 +1,7 @@
 /**
  * @file background.js (Service Worker)
  * @description Handles background tasks for the extension, such as
- * managing extension state, icon updates, and command listeners.
+ * managing extension state and icon updates.
  */
 
 const DEFAULT_SETTINGS = {
@@ -24,6 +24,8 @@ function updateActionState(isActive) {
   const iconPathPrefix = isActive ? 'icons/icon-on-' : 'icons/icon-off-';
   const title = isActive ? 'Голосовой Ввод Pro (Включено)' : 'Голосовой Ввод Pro (Выключено)';
 
+  console.log(`Background: Updating action state. Active: ${isActive}, IconPrefix: ${iconPathPrefix}`);
+
   chrome.action.setIcon({
     path: {
       '16': `${iconPathPrefix}16.png`,
@@ -33,108 +35,100 @@ function updateActionState(isActive) {
     }
   }, () => {
     if (chrome.runtime.lastError) {
-      // Эта ошибка может возникать, если иконки не найдены. Убедитесь, что пути верны.
-      console.warn('Background: Error setting icon:', chrome.runtime.lastError.message);
-    }
-  });
-  chrome.action.setTitle({ title });
-}
-
-/**
- * Sends a message to the content script in the active tab.
- * @param {object} message - The message object to send.
- */
-function sendMessageToActiveContentScript(message) {
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    if (tabs[0] && tabs[0].id) {
-      chrome.tabs.sendMessage(tabs[0].id, message, (response) => {
-        if (chrome.runtime.lastError) {
-          // Ожидаемо, если на странице нет content script или он не готов
-          if (chrome.runtime.lastError.message !== "Could not establish connection. Receiving end does not exist.") {
-            console.warn(`Background: Error sending message ${message.command}:`, chrome.runtime.lastError.message);
-          }
-        } else {
-          console.log(`Background: Message ${message.command} response:`, response);
-        }
-      });
+      console.warn('Background: Error setting icon:', chrome.runtime.lastError.message, 'Path prefix used:', iconPathPrefix);
     } else {
-      console.log('Background: No active tab found to send message.');
+      console.log('Background: Icon set successfully for state:', isActive);
+    }
+  });
+
+  chrome.action.setTitle({ title: title }, () => {
+     if (chrome.runtime.lastError) {
+      console.warn('Background: Error setting title:', chrome.runtime.lastError.message);
+    } else {
+      console.log('Background: Title set successfully for state:', isActive);
     }
   });
 }
-
 
 // 1. Инициализация/обновление настроек при установке/обновлении расширения
 chrome.runtime.onInstalled.addListener((details) => {
-  if (details.reason === 'install' || details.reason === 'update') {
-    chrome.storage.sync.get(DEFAULT_SETTINGS, (currentSettings) => {
-      // Устанавливаем только те значения по умолчанию, которые еще не определены
-      // или если мы хотим принудительно обновить структуру настроек.
-      // Для простоты, мы просто объединим с текущими, отдавая приоритет существующим.
-      const newSettings = { ...DEFAULT_SETTINGS, ...currentSettings };
+  console.log('Background: onInstalled event, reason:', details.reason);
+  // Загружаем все настройки, чтобы не затереть существующие пользовательские настройки при обновлении,
+  // а только добавить новые ключи из DEFAULT_SETTINGS, если их нет.
+  chrome.storage.sync.get(null, (currentSettings) => {
+    const newSettings = { ...DEFAULT_SETTINGS, ...currentSettings };
 
-      // Особый случай: если dictationActive не был определен, устанавливаем его в true (из DEFAULT_SETTINGS)
-      if (typeof currentSettings.dictationActive === 'undefined') {
-        newSettings.dictationActive = DEFAULT_SETTINGS.dictationActive;
-      }
-      // Аналогично для других ключевых настроек, если нужно
-      if (typeof currentSettings.dictationLang === 'undefined') {
-        newSettings.dictationLang = DEFAULT_SETTINGS.dictationLang;
-      }
+    // Явно устанавливаем значения по умолчанию для ключевых настроек, если они отсутствуют
+    if (typeof currentSettings.dictationActive === 'undefined') {
+      newSettings.dictationActive = DEFAULT_SETTINGS.dictationActive;
+    }
+    if (typeof currentSettings.dictationLang === 'undefined') {
+      newSettings.dictationLang = DEFAULT_SETTINGS.dictationLang;
+    }
+    // Добавьте сюда другие настройки из DEFAULT_SETTINGS, если для них критично иметь значение по умолчанию
 
-
-      chrome.storage.sync.set(newSettings, () => {
-        console.log('Background: Extension installed/updated. Initial/updated settings applied.');
-        updateActionState(newSettings.dictationActive);
-      });
+    chrome.storage.sync.set(newSettings, () => {
+      console.log('Background: Extension installed/updated. Initial/updated settings applied:', newSettings);
+      updateActionState(newSettings.dictationActive);
     });
-  }
+  });
 });
 
 // 2. Слушаем изменения в chrome.storage для обновления иконки
 //    (например, если состояние dictationActive изменено из popup.js)
 chrome.storage.onChanged.addListener((changes, namespace) => {
+  console.log('Background: storage.onChanged event. Namespace:', namespace, 'Changes:', changes);
   if (namespace === 'sync') {
     if (changes.dictationActive) {
       const isActive = changes.dictationActive.newValue;
+      console.log('Background: dictationActive changed in storage. New value:', isActive);
       updateActionState(isActive);
-      console.log('Background: dictationActive changed in storage, icon updated to:', isActive);
     }
-    // Другие настройки, если они влияют на background логику (сейчас нет таких)
   }
 });
 
 // 3. При запуске браузера, убедимся, что иконка соответствует сохраненному состоянию
 chrome.runtime.onStartup.addListener(() => {
+  console.log('Background: onStartup event.');
   chrome.storage.sync.get('dictationActive', (result) => {
     const isActive = result.dictationActive !== undefined ? result.dictationActive : DEFAULT_SETTINGS.dictationActive;
+    console.log('Background: Browser startup, retrieved dictationActive:', isActive);
     updateActionState(isActive);
-    console.log('Background: Browser startup, icon state set to:', isActive);
   });
 });
 
-// 4. Слушаем команды (например, горячие клавиши)
-chrome.commands.onCommand.addListener((command) => {
-  console.log(`Background: Command received: ${command}`);
-  if (command === 'toggle-dictation') {
-    chrome.storage.sync.get('dictationActive', (result) => {
-      const currentActiveState = result.dictationActive !== undefined ? result.dictationActive : DEFAULT_SETTINGS.dictationActive;
-      const newActiveState = !currentActiveState;
-      chrome.storage.sync.set({ dictationActive: newActiveState }, () => {
-        // Иконка обновится через storage.onChanged.
-        // Отправим прямое сообщение в content script для немедленной реакции.
-        sendMessageToActiveContentScript({ command: "toggleDictation", data: newActiveState });
-        console.log(`Background: 'toggle-dictation' command processed. New state: ${newActiveState}`);
-      });
-    });
-  }
-});
+// Примечание: sendMessageToActiveContentScript была связана с обработкой команд,
+// если она больше нигде не используется, её можно удалить.
+// В текущем сценарии, когда popup.js напрямую общается с content.js,
+// а background.js только реагирует на storage, эта функция может быть не нужна.
+// Оставим её на случай, если в будущем понадобится фоновая отправка сообщений.
+/**
+ * Sends a message to the content script in the active tab.
+ * @param {object} message - The message object to send.
+ */
+// function sendMessageToActiveContentScript(message) { // Если не используется, можно удалить
+//   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+//     if (tabs[0] && tabs[0].id) {
+//       chrome.tabs.sendMessage(tabs[0].id, message, (response) => {
+//         if (chrome.runtime.lastError) {
+//           if (chrome.runtime.lastError.message !== "Could not establish connection. Receiving end does not exist.") {
+//             console.warn(`Background: Error sending message ${message.command}:`, chrome.runtime.lastError.message);
+//           }
+//         } else {
+//           console.log(`Background: Message ${message.command} response:`, response);
+//         }
+//       });
+//     } else {
+//       console.log('Background: No active tab found to send message.');
+//     }
+//   });
+// }
 
-// Проверка при запуске service worker (полезно для отладки)
-console.log("Background service worker started.");
-// Установим иконку сразу при запуске service worker, не дожидаясь onStartup или onInstalled.
-// Это помогает, если service worker перезапускается во время работы браузера.
+
+// Убеждаемся, что иконка установлена правильно при старте/рестарте Service Worker
+console.log("Background service worker starting/restarting...");
 chrome.storage.sync.get('dictationActive', (result) => {
     const isActive = result.dictationActive !== undefined ? result.dictationActive : DEFAULT_SETTINGS.dictationActive;
+    console.log('Background: Initial check/set of icon state on SW start. Active:', isActive);
     updateActionState(isActive);
 });
