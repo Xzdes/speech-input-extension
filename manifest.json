@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Голосовой Ввод Pro",
-  "version": "1.0",
-  "description": "Автоматически вводит текст с микрофона в активное поле ввода.",
+  "version": "2.0",
+  "description": "Автоматически вводит текст с микрофона, с поддержкой горячих клавиш, черного списка, автозамены, команд форматирования и опционального перевода.",
   "permissions": [
-    "storage",     
-    "activeTab"   
+    "storage",
+    "activeTab",
+    "scripting"
   ],
-  "host_permissions": [ 
+  "host_permissions": [
     "<all_urls>"
   ],
   "background": {
@@ -17,7 +18,7 @@
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
-      "run_at": "document_idle" 
+      "run_at": "document_idle"
     }
   ],
   "action": {
@@ -35,5 +36,14 @@
     "32": "icons/icon-off-32.png",
     "48": "icons/icon-off-48.png",
     "128": "icons/icon-off-128.png"
+  },
+  "commands": {
+    "toggle-dictation": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S",
+        "mac": "Command+Shift+S"
+      },
+      "description": "Включить/Выключить диктовку"
+    }
   }
 }
