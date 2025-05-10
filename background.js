@@ -12,7 +12,19 @@ const DEFAULT_SETTINGS = {
   translationLang: 'en',
   geminiModel: 'gemini-1.5-flash-latest',
   customGeminiModel: '',
-  autoReplaceRules: '',
+  autoReplaceRules:
+`вопросительный знак : ?
+восклицательный знак : !
+точка : .
+запятая : ,
+двоеточие : :
+точка с запятой : ;
+тире : -
+дефис : -
+открыть скобку : (
+закрыть скобку : )
+новая строка : \\n
+абзац : \\n\\n`,
   blacklistSites: ''
 };
 
@@ -59,13 +71,20 @@ chrome.runtime.onInstalled.addListener((details) => {
     const newSettings = { ...DEFAULT_SETTINGS, ...currentSettings };
 
     // Явно устанавливаем значения по умолчанию для ключевых настроек, если они отсутствуют
-    if (typeof currentSettings.dictationActive === 'undefined') {
-      newSettings.dictationActive = DEFAULT_SETTINGS.dictationActive;
-    }
-    if (typeof currentSettings.dictationLang === 'undefined') {
-      newSettings.dictationLang = DEFAULT_SETTINGS.dictationLang;
-    }
-    // Добавьте сюда другие настройки из DEFAULT_SETTINGS, если для них критично иметь значение по умолчанию
+    // или если это первая установка.
+    Object.keys(DEFAULT_SETTINGS).forEach(key => {
+      if (typeof currentSettings[key] === 'undefined') {
+        newSettings[key] = DEFAULT_SETTINGS[key];
+      }
+    });
+    // Если при обновлении мы хотим принудительно установить новые дефолтные правила автозамены,
+    // ТОЛЬКО если пользователь их не менял (или это первая установка),
+    // то можно добавить специальную логику. Но обычно {...DEFAULT_SETTINGS, ...currentSettings}
+    // корректно обрабатывает новые ключи и не перезаписывает измененные пользователем.
+    // Для autoReplaceRules: если details.reason === 'install', то newSettings.autoReplaceRules будет из DEFAULT_SETTINGS.
+    // Если details.reason === 'update' и currentSettings.autoReplaceRules уже существует, он останется.
+    // Если это первое добавление autoReplaceRules в DEFAULT_SETTINGS и пользователь обновляется со старой версии,
+    // где этого ключа не было, то currentSettings.autoReplaceRules будет undefined, и применится DEFAULT_SETTINGS.autoReplaceRules.
 
     chrome.storage.sync.set(newSettings, () => {
       console.log('Background: Extension installed/updated. Initial/updated settings applied:', newSettings);
@@ -97,38 +116,23 @@ chrome.runtime.onStartup.addListener(() => {
   });
 });
 
-// Примечание: sendMessageToActiveContentScript была связана с обработкой команд,
-// если она больше нигде не используется, её можно удалить.
-// В текущем сценарии, когда popup.js напрямую общается с content.js,
-// а background.js только реагирует на storage, эта функция может быть не нужна.
-// Оставим её на случай, если в будущем понадобится фоновая отправка сообщений.
-/**
- * Sends a message to the content script in the active tab.
- * @param {object} message - The message object to send.
- */
-// function sendMessageToActiveContentScript(message) { // Если не используется, можно удалить
-//   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-//     if (tabs[0] && tabs[0].id) {
-//       chrome.tabs.sendMessage(tabs[0].id, message, (response) => {
-//         if (chrome.runtime.lastError) {
-//           if (chrome.runtime.lastError.message !== "Could not establish connection. Receiving end does not exist.") {
-//             console.warn(`Background: Error sending message ${message.command}:`, chrome.runtime.lastError.message);
-//           }
-//         } else {
-//           console.log(`Background: Message ${message.command} response:`, response);
-//         }
-//       });
-//     } else {
-//       console.log('Background: No active tab found to send message.');
-//     }
-//   });
-// }
-
+// Функция sendMessageToActiveContentScript удалена, так как не используется.
 
 // Убеждаемся, что иконка установлена правильно при старте/рестарте Service Worker
 console.log("Background service worker starting/restarting...");
 chrome.storage.sync.get('dictationActive', (result) => {
-    const isActive = result.dictationActive !== undefined ? result.dictationActive : DEFAULT_SETTINGS.dictationActive;
+    // Проверяем, существует ли значение dictationActive в хранилище,
+    // иначе используем значение из DEFAULT_SETTINGS.
+    let isActive;
+    if (typeof result.dictationActive === 'undefined') {
+        console.log('Background: dictationActive not found in storage on SW start, using default.');
+        isActive = DEFAULT_SETTINGS.dictationActive;
+        // Сохраняем значение по умолчанию в хранилище, если его там нет.
+        // Это важно, чтобы при следующем запуске оно уже было.
+        chrome.storage.sync.set({ dictationActive: isActive });
+    } else {
+        isActive = result.dictationActive;
+    }
     console.log('Background: Initial check/set of icon state on SW start. Active:', isActive);
     updateActionState(isActive);
 });

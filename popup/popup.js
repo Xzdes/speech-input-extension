@@ -8,7 +8,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Основные элементы управления
   const toggleDictationCheckbox = document.getElementById('toggleDictation');
   const languageSelect = document.getElementById('languageSelect');
-  const hotkeyDisplay = document.getElementById('hotkeyDisplay');
+  // const hotkeyDisplay = document.getElementById('hotkeyDisplay'); // Удалено, т.к. hotkeyDisplay удален из HTML
 
   // Элементы настроек перевода
   const toggleTranslationCheckbox = document.getElementById('toggleTranslation');
@@ -33,7 +33,19 @@ document.addEventListener('DOMContentLoaded', () => {
     translationLang: 'en',
     geminiModel: 'gemini-1.5-flash-latest',
     customGeminiModel: '',
-    autoReplaceRules: '', // Пример: "запятая : ,\nточка : ."
+    autoReplaceRules:
+`вопросительный знак : ?
+восклицательный знак : !
+точка : .
+запятая : ,
+двоеточие : :
+точка с запятой : ;
+тире : -
+дефис : -
+открыть скобку : (
+закрыть скобку : )
+новая строка : \\n
+абзац : \\n\\n`, // Предзаполненные правила
     blacklistSites: ''   // Пример: "example.com\nanothersite.org"
   };
 
@@ -63,8 +75,8 @@ document.addEventListener('DOMContentLoaded', () => {
       // Настройки черного списка
       blacklistSitesTextarea.value = settings.blacklistSites;
 
-      // Загрузка и отображение горячей клавиши
-      loadHotkey();
+      // Загрузка и отображение горячей клавиши - функционал удален
+      // loadHotkey();
     });
   }
 
@@ -85,22 +97,22 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   /**
-   * Загружает и отображает назначенную горячую клавишу.
+   * Загружает и отображает назначенную горячую клавишу. - ФУНКЦИЯ БОЛЬШЕ НЕ НУЖНА
    */
-  function loadHotkey() {
-    if (chrome.commands) {
-      chrome.commands.getAll((commands) => {
-        const toggleCommand = commands.find(command => command.name === 'toggle-dictation');
-        if (toggleCommand && toggleCommand.shortcut) {
-          hotkeyDisplay.textContent = toggleCommand.shortcut;
-        } else {
-          hotkeyDisplay.textContent = 'Не назначена';
-        }
-      });
-    } else {
-      hotkeyDisplay.textContent = 'API команд недоступно';
-    }
-  }
+  // function loadHotkey() {
+  //   if (chrome.commands) {
+  //     chrome.commands.getAll((commands) => {
+  //       const toggleCommand = commands.find(command => command.name === 'toggle-dictation');
+  //       if (toggleCommand && toggleCommand.shortcut) {
+  //         hotkeyDisplay.textContent = toggleCommand.shortcut;
+  //       } else {
+  //         hotkeyDisplay.textContent = 'Не назначена';
+  //       }
+  //     });
+  //   } else {
+  //     hotkeyDisplay.textContent = 'API команд недоступно';
+  //   }
+  // }
 
   /**
    * Обновляет состояние полей, связанных с переводом, в зависимости от того, включен ли перевод.
