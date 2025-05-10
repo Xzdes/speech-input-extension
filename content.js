@@ -34,86 +34,83 @@ let settings = {
 закрыть скобку : )
 новая строка : \\n
 абзац : \\n\\n`,
-  blacklistSites: ''
+  blacklistSites: '',
+  interimResultsEnabled: true,
+  disableBrowserAutoPunctuation: true,
+  promptGeneratorModeActive: false,
+  autoInsertGeneratedPrompt: false
 };
 
 let parsedAutoReplaceRules = [];
 let parsedBlacklistSites = [];
 
+let isPromptGeneratorModeActive = false;
+let collectedPromptIdeas = "";
+
 const RECOGNITION_TIMEOUT_MS = 30000;
 const RESTART_DELAY_MS = 50;
 const FOCUS_DEBOUNCE_MS = 50;
-const SCROLL_RESIZE_DEBOUNCE_MS = 150; // Для debounce позиционирования индикатора
+const SCROLL_RESIZE_DEBOUNCE_MS = 150;
+const USER_EDIT_RESTART_DELAY_MS = 100;
 
-const GEMINI_API_ENDPOINT_PREFIX = "https://generativelanguage.googleapis.com/v1beta/models/";
-const GEMINI_API_ENDPOINT_SUFFIX = ":generateContent?key=";
-
-// --- Индикатор состояния ---
-const INDICATOR_ID = 'speech-pro-indicator';
+const INDICATOR_ID = 'smart-voice-input-indicator';
 let indicatorElement = null;
 const IndicatorState = {
-  IDLE: 'IDLE', // Скрыт
-  LISTENING: 'LISTENING', // Слушаю... 🎤
-  PROCESSING: 'PROCESSING', // Обработка... ⚙️
-  TRANSLATING: 'TRANSLATING', // Перевод... 🌍
+  IDLE: 'IDLE', LISTENING: 'LISTENING', PROCESSING: 'PROCESSING', TRANSLATING: 'TRANSLATING',
+  BLACKLISTED: 'BLACKLISTED', NO_MIC_ACCESS: 'NO_MIC_ACCESS', PASSWORD_FIELD: 'PASSWORD_FIELD',
+  RECOGNITION_ERROR: 'RECOGNITION_ERROR',
+  PROMPT_COLLECTING: 'PROMPT_COLLECTING'
 };
 let currentIndicatorState = IndicatorState.IDLE;
-let indicatorUpdateTimer = null; // Для анимации точек
-let dotCount = 0; // <--- ОБЪЯВЛЕНИЕ ПЕРЕМЕННОЙ
+let indicatorUpdateTimer = null;
+let dotCount = 0;
+let temporaryIndicatorClearTimer = null;
 
-// --- Переменные для управления обработкой ---
+let currentInterimText = '';
+let interimPhraseStartPosition = null;
+let isDisplayingInterim = false;
+let hasUserEditedDuringInterim = false;
+
 let isProcessingTranscript = false;
 let transcriptQueue = [];
 
-// --- Утилита debounce ---
 function debounce(func, wait) {
   let timeout;
   return function executedFunction(...args) {
-    const later = () => {
-      clearTimeout(timeout);
-      func(...args);
-    };
-    clearTimeout(timeout);
-    timeout = setTimeout(later, wait);
+    const later = () => { clearTimeout(timeout); func(...args); };
+    clearTimeout(timeout); timeout = setTimeout(later, wait);
   };
 }
 
-
-// --- Инициализация ---
 async function loadSettingsAndInitialize() {
   try {
     const loadedSettings = await new Promise((resolve) => {
       chrome.storage.sync.get(settings, (items) => { resolve(items); });
     });
     settings = { ...settings, ...loadedSettings };
-
     isDictationGloballyActive = settings.dictationActive;
     currentLang = settings.dictationLang;
-    parseAutoReplaceRules(settings.autoReplaceRules);
-    parseBlacklistSites(settings.blacklistSites);
-    // console.log('Content Script: Settings loaded and parsed:', settings); // DEBUG
-
-    if (isOnBlacklist()) {
-      // console.log('Content Script: Current site is blacklisted. Extension inactive.'); // DEBUG
-      return;
+    isPromptGeneratorModeActive = settings.promptGeneratorModeActive;
+    if (typeof loadedSettings.interimResultsEnabled !== 'undefined') {
+        settings.interimResultsEnabled = loadedSettings.interimResultsEnabled;
     }
 
+    parseAutoReplaceRules(settings.autoReplaceRules);
+    parseBlacklistSites(settings.blacklistSites);
+    if (isOnBlacklist(window.location.href)) return;
     if (document.activeElement && isEditable(document.activeElement)) {
       currentFocusedInput = document.activeElement;
-      if (isDictationGloballyActive && !isRecognitionActuallyRunning) {
+      if (shouldStartRecognitionFor(currentFocusedInput)) {
         startRecognition(currentFocusedInput);
       }
     }
     initializeEventListeners();
-  } catch (error) {
-    console.error('Content Script: Error loading settings:', error);
-  }
+  } catch (error) { console.error('SVI: Error loading settings:', error); }
 }
 
-function isOnBlacklist() {
-  if (!parsedBlacklistSites || parsedBlacklistSites.length === 0) { return false; }
-  const currentUrl = window.location.href;
-  return parsedBlacklistSites.some(sitePattern => currentUrl.includes(sitePattern));
+function isOnBlacklist(url) {
+  if (!parsedBlacklistSites || parsedBlacklistSites.length === 0) return false;
+  return parsedBlacklistSites.some(sitePattern => url.includes(sitePattern));
 }
 
 function parseAutoReplaceRules(rulesString) {
@@ -125,9 +122,7 @@ function parseAutoReplaceRules(rulesString) {
       if (parts.length === 2) {
         const key = parts[0].trim();
         const value = parts[1].trim().replace(/\\n/g, '\n');
-        if (key) {
-          parsedAutoReplaceRules.push({ key, value, regex: new RegExp(escapeRegExp(key), 'gi') });
-        }
+        if (key) parsedAutoReplaceRules.push({ key, value, regex: new RegExp(escapeRegExp(key), 'gi') });
       }
     });
   }
@@ -136,142 +131,223 @@ function parseAutoReplaceRules(rulesString) {
 function parseBlacklistSites(blacklistString) {
   parsedBlacklistSites = [];
   if (blacklistString && typeof blacklistString === 'string') {
-    parsedBlacklistSites = blacklistString.split('\n')
-      .map(site => site.trim())
-      .filter(site => site.length > 0);
+    parsedBlacklistSites = blacklistString.split('\n').map(s => s.trim()).filter(s => s.length > 0);
   }
 }
 
-function escapeRegExp(string) {
-  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+function escapeRegExp(string) { return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-// --- Слушатели сообщений и событий ---
 let listenersInitialized = false;
 const debouncedPositionIndicator = debounce(() => positionIndicator(true), SCROLL_RESIZE_DEBOUNCE_MS);
 
 function initializeEventListeners() {
-    if (listenersInitialized) return;
-    if (isOnBlacklist()) return;
-
+    if (listenersInitialized || isOnBlacklist(window.location.href)) return;
     chrome.runtime.onMessage.addListener(handleMessages);
     document.addEventListener('focusin', handleFocusIn, true);
     document.addEventListener('focusout', handleFocusOut, true);
     window.addEventListener('beforeunload', handleBeforeUnload);
     window.addEventListener('scroll', debouncedPositionIndicator, true);
     window.addEventListener('resize', debouncedPositionIndicator, true);
-
     listenersInitialized = true;
-    // console.log("Content Script: Event listeners initialized."); // DEBUG
 }
 
 function handleMessages(request, sender, sendResponse) {
-  let initialBlacklistStatus = isOnBlacklist();
-  if (initialBlacklistStatus && request.command !== "blacklistChanged") {
-      sendResponse({ status: "ok", info: "Site is blacklisted" });
-      return true;
-  }
-  // console.log('Content Script: Message received:', request); // DEBUG
-  let needsRecognitionRestart = false;
+  const currentUrl = window.location.href;
+  let initialBlacklistStatus = isOnBlacklist(currentUrl);
 
+  if (initialBlacklistStatus &&
+      request.command !== "blacklistChanged" &&
+      request.command !== "setPromptGeneratorMode" &&
+      request.command !== "insertGeneratedPrompt") {
+    sendResponse({ status: "ok", info: "Site is blacklisted" }); return true;
+  }
+
+  let needsRecognitionRestart = false;
   switch (request.command) {
     case 'toggleDictation':
-      isDictationGloballyActive = request.data;
-      settings.dictationActive = request.data;
+      isDictationGloballyActive = request.data; settings.dictationActive = request.data;
       if (!isDictationGloballyActive && isRecognitionActuallyRunning) {
         stopRecognition();
-      } else if (isDictationGloballyActive && currentFocusedInput && !isRecognitionActuallyRunning) {
-        if (document.activeElement === currentFocusedInput && isEditable(currentFocusedInput)) {
-           startRecognition(currentFocusedInput);
-        } else if (document.activeElement && isEditable(document.activeElement)) {
-            currentFocusedInput = document.activeElement;
-            startRecognition(currentFocusedInput);
-        } else { currentFocusedInput = null; }
+      } else if (isDictationGloballyActive && currentFocusedInput && !isRecognitionActuallyRunning && shouldStartRecognitionFor(currentFocusedInput)) {
+        startRecognition(currentFocusedInput);
       }
       sendResponse({ status: 'ok', newDictationState: isDictationGloballyActive });
       break;
+    case 'setPromptGeneratorMode':
+      const oldPromptModeState = isPromptGeneratorModeActive;
+      isPromptGeneratorModeActive = request.isActive;
+      settings.promptGeneratorModeActive = request.isActive;
+      // console.log("SVI Content: Prompt Generator Mode set to", isPromptGeneratorModeActive, "Old mode was:", oldPromptModeState); // DEBUG
+
+      if (isPromptGeneratorModeActive) {
+        resetInterimState(); 
+        collectedPromptIdeas = "";
+        if (isRecognitionActuallyRunning && !oldPromptModeState) {
+            needsRecognitionRestart = true;
+        } else if (currentFocusedInput && shouldStartRecognitionFor(currentFocusedInput)) {
+            startRecognition(currentFocusedInput);
+        }
+      } else { 
+        sendCollectedPromptIdeas();
+        resetInterimState();
+        if (isRecognitionActuallyRunning && oldPromptModeState) {
+             needsRecognitionRestart = true;
+        }
+      }
+      if (isRecognitionActuallyRunning && currentFocusedInput) {
+          updateIndicatorState(isPromptGeneratorModeActive ? IndicatorState.PROMPT_COLLECTING : IndicatorState.LISTENING, currentFocusedInput);
+      }
+      sendResponse({ status: 'ok', newPromptGeneratorMode: isPromptGeneratorModeActive });
+      break;
+    case 'insertGeneratedPrompt':
+        if (request.promptToInsert && currentFocusedInput && isEditable(currentFocusedInput)) {
+            clearInput(currentFocusedInput);
+            insertText(currentFocusedInput, request.promptToInsert);
+            sendResponse({status: "prompt_inserted"});
+        } else {
+            sendResponse({status: "prompt_not_inserted", reason: "no target or no prompt"});
+        }
+        break;
     case 'languageChanged':
-      currentLang = request.newLang;
-      settings.dictationLang = request.newLang;
+      currentLang = request.newLang; settings.dictationLang = request.newLang;
       if (isRecognitionActuallyRunning) needsRecognitionRestart = true;
       sendResponse({ status: 'language update processed' });
       break;
-    case 'translationStateChanged': settings.translationActive = request.translationActive; sendResponse({ status: 'translation state updated' }); break;
-    case 'translationLangChanged': settings.translationLang = request.newLang; sendResponse({ status: 'translation language updated' }); break;
-    case 'geminiModelChanged': settings.geminiModel = request.model; settings.customGeminiModel = request.customModel; sendResponse({ status: 'gemini model updated'}); break;
-    case 'autoReplaceRulesChanged': settings.autoReplaceRules = request.rules; parseAutoReplaceRules(settings.autoReplaceRules); sendResponse({ status: 'rules updated' }); break;
+    case 'translationStateChanged':
+      settings.translationActive = request.translationActive;
+      sendResponse({ status: 'ok' });
+      break;
+    case 'translationLangChanged':
+      settings.translationLang = request.newLang;
+      sendResponse({ status: 'ok' });
+      break;
+    case 'geminiModelChanged':
+      settings.geminiModel = request.model; settings.customGeminiModel = request.customModel;
+      sendResponse({ status: 'ok' });
+      break;
+    case 'autoReplaceRulesChanged':
+      settings.autoReplaceRules = request.rules; parseAutoReplaceRules(settings.autoReplaceRules);
+      sendResponse({ status: 'ok' });
+      break;
+    case 'disableBrowserAutoPunctuationChanged':
+        settings.disableBrowserAutoPunctuation = request.disableBrowserAutoPunctuation;
+        sendResponse({ status: 'ok' });
+        break;
     case 'blacklistChanged':
-      settings.blacklistSites = request.blacklist;
-      parseBlacklistSites(settings.blacklistSites);
-      const nowOnBlacklist = isOnBlacklist();
-      sendResponse({ status: 'blacklist updated', isOnBlacklist: nowOnBlacklist });
+      settings.blacklistSites = request.blacklist; parseBlacklistSites(settings.blacklistSites);
+      const nowOnBlacklist = isOnBlacklist(currentUrl);
+      sendResponse({ status: 'ok', isOnBlacklist: nowOnBlacklist });
       if (nowOnBlacklist && isRecognitionActuallyRunning) {
-        stopRecognition();
+        stopRecognition(); updateIndicatorState(IndicatorState.BLACKLISTED, currentFocusedInput, true);
       } else if (!nowOnBlacklist && initialBlacklistStatus) {
-        if (!listenersInitialized) { loadSettingsAndInitialize(); }
-        else if (isDictationGloballyActive && currentFocusedInput && !isRecognitionActuallyRunning) {
-            if (document.activeElement === currentFocusedInput && isEditable(currentFocusedInput)) startRecognition(currentFocusedInput);
-            else if (document.activeElement && isEditable(document.activeElement)) { currentFocusedInput = document.activeElement; startRecognition(currentFocusedInput); }
-        }
+        if (!listenersInitialized) loadSettingsAndInitialize();
+        else if (currentFocusedInput && shouldStartRecognitionFor(currentFocusedInput)) startRecognition(currentFocusedInput);
       }
       break;
-    default: sendResponse({ status: 'unknown command' }); break;
+    default:
+      sendResponse({ status: 'unknown command' });
+      break;
   }
 
-  if (needsRecognitionRestart && currentFocusedInput && isDictationGloballyActive) {
+  if (needsRecognitionRestart && currentFocusedInput && isEditable(currentFocusedInput)) {
     const activeElementForRestart = currentFocusedInput;
     stopRecognition(() => {
-        if (isDictationGloballyActive && document.body.contains(activeElementForRestart) &&
-            document.activeElement === activeElementForRestart && !isRecognitionActuallyRunning) {
-            startRecognition(activeElementForRestart);
-        }
+      if (shouldStartRecognitionFor(activeElementForRestart) && document.activeElement === activeElementForRestart) {
+        startRecognition(activeElementForRestart);
+      }
     });
   }
   return true;
 }
 
+/**
+ * Отправляет накопленные идеи для промпта, если они есть.
+ */
+function sendCollectedPromptIdeas() {
+    if (isPromptGeneratorModeActive && collectedPromptIdeas.trim()) {
+        // console.log("SVI Content: Sending collected prompt ideas:", collectedPromptIdeas); // DEBUG
+        chrome.runtime.sendMessage({ command: "userIdeasForPromptCollected", userText: collectedPromptIdeas });
+        collectedPromptIdeas = ""; // Очищаем после отправки
+    }
+}
+
 let focusTimeout = null;
+function shouldStartRecognitionFor(element) {
+    if (!element) return false;
+    const canStart = (isDictationGloballyActive || isPromptGeneratorModeActive) &&
+           !isRecognitionActuallyRunning && isEditable(element) &&
+           element.type !== 'password';
+    if (isPromptGeneratorModeActive) return canStart;
+    return canStart && !isOnBlacklist(window.location.href);
+}
+
 function handleFocusIn(event) {
-  if (isOnBlacklist()) return;
   const target = event.target;
   clearTimeout(focusTimeout);
-
+  if (isOnBlacklist(window.location.href) && !isPromptGeneratorModeActive) {
+    if (isEditable(target)) updateIndicatorState(IndicatorState.BLACKLISTED, target, true);
+    return;
+  }
   if (isEditable(target)) {
     if (target.type === 'password') {
-        if (isRecognitionActuallyRunning && currentFocusedInput === target) { stopRecognition(); }
-        currentFocusedInput = null; updateIndicatorState(IndicatorState.IDLE); return;
+      if (isRecognitionActuallyRunning && currentFocusedInput === target) stopRecognition();
+      currentFocusedInput = target; updateIndicatorState(IndicatorState.PASSWORD_FIELD, target, true); return;
     }
+    if (currentFocusedInput && currentFocusedInput !== target && isRecognitionActuallyRunning) stopRecognition();
     currentFocusedInput = target;
-    if (isDictationGloballyActive && !isRecognitionActuallyRunning) {
+    if (settings.interimResultsEnabled && typeof target.addEventListener === 'function') {
+        target.removeEventListener('input', handleUserInputDuringInterim);
+        target.addEventListener('input', handleUserInputDuringInterim);
+    }
+    if (shouldStartRecognitionFor(target)) {
       focusTimeout = setTimeout(() => {
-        if (document.activeElement === target && isDictationGloballyActive && !isRecognitionActuallyRunning) {
+        if (document.activeElement === target && shouldStartRecognitionFor(target)) {
           startRecognition(target);
         }
       }, FOCUS_DEBOUNCE_MS);
     }
   } else {
-    // Фокус на нередактируемом элементе. Если распознавание шло, оно остановится через onend.
-    // Индикатор должен скрыться, если currentFocusedInput больше не валиден для распознавания.
-    // updateIndicatorState(IndicatorState.IDLE); // Может быть слишком агрессивно, onend обработает
+    if (isRecognitionActuallyRunning && currentFocusedInput && isEditable(currentFocusedInput)) stopRecognition();
+    updateIndicatorState(IndicatorState.IDLE);
   }
 }
 
 function handleFocusOut(event) {
-  if (isOnBlacklist()) return;
-  const target = event.target;
-  // Если фокус уходит с currentFocusedInput на что-то нередактируемое или из окна,
-  // onend должен корректно завершить распознавание.
-  // Если currentFocusedInput был тем, для кого показывался индикатор, и фокус ушел,
-  // onend должен скрыть индикатор.
-  if (target === currentFocusedInput && (!event.relatedTarget || !isEditable(event.relatedTarget))) {
-     // console.log("Focus lost from editable field to non-editable or outside window."); // DEBUG
-     // Не останавливаем принудительно, даем onend отработать
+  const target = event.target; const relatedTarget = event.relatedTarget;
+  if (target === currentFocusedInput && isRecognitionActuallyRunning) {
+    if (!relatedTarget || !isEditable(relatedTarget) || (isOnBlacklist(window.location.href) && !isPromptGeneratorModeActive) || (relatedTarget && relatedTarget.type === 'password')) {
+      sendCollectedPromptIdeas(); // Отправляем идеи, если они были и уходим с поля
+      stopRecognition();
+    }
+  }
+  if (target === currentFocusedInput && !isRecognitionActuallyRunning) {
+      if (!relatedTarget || !isEditable(relatedTarget)) {
+          currentFocusedInput = null; updateIndicatorState(IndicatorState.IDLE);
+      }
+  }
+  if (settings.interimResultsEnabled && target && typeof target.removeEventListener === 'function') {
+    target.removeEventListener('input', handleUserInputDuringInterim);
   }
 }
 
+function handleUserInputDuringInterim() {
+    if (settings.interimResultsEnabled && isDisplayingInterim && isRecognitionActuallyRunning) {
+        const targetToRestart = currentFocusedInput;
+        // console.log("SVI: User edit detected. Stopping current recognition session."); // DEBUG
+        stopRecognition(() => {
+            setTimeout(() => {
+                if (targetToRestart && document.activeElement === targetToRestart && shouldStartRecognitionFor(targetToRestart)) {
+                    // console.log("SVI: Restarting recognition after user edit for:", targetToRestart); // DEBUG
+                    startRecognition(targetToRestart);
+                }
+            }, USER_EDIT_RESTART_DELAY_MS);
+        });
+    }
+}
+
 function handleBeforeUnload() {
+  sendCollectedPromptIdeas();
   if (isRecognitionActuallyRunning) stopRecognition();
-  updateIndicatorState(IndicatorState.IDLE);
 }
 
 function isEditable(element) {
@@ -281,45 +357,104 @@ function isEditable(element) {
     tagName === 'textarea' || element.isContentEditable) && !element.disabled && !element.readOnly;
 }
 
-// --- Логика распознавания речи ---
-function startRecognition(targetElement) {
-  if (isOnBlacklist() || !isDictationGloballyActive || !targetElement || !isEditable(targetElement)) {
-    updateIndicatorState(IndicatorState.IDLE); return;
-  }
-  if (isRecognitionActuallyRunning) {
-    if (recognition && recognition.targetElement !== targetElement) stopRecognition();
-    else return; // Уже идет для этого элемента
-  }
+function triggerInputEvents(element) {
+    if (!element) return;
+    const eventsToDispatch = [
+        { type: 'input', options: { bubbles: true, cancelable: false } },
+        { type: 'change', options: { bubbles: true, cancelable: true } },
+    ];
+    eventsToDispatch.forEach(eventConfig => {
+        let event;
+        try {
+            event = new Event(eventConfig.type, eventConfig.options);
+            element.dispatchEvent(event);
+        } catch (e) { console.warn(`SVI: Error dispatching ${eventConfig.type} event:`, e); }
+    });
+}
 
+function startRecognition(targetElement) {
+  if (!shouldStartRecognitionFor(targetElement)) {
+    if (currentIndicatorState !== IndicatorState.IDLE && (!indicatorElement || indicatorElement.targetElement === targetElement)) {
+         updateIndicatorState(IndicatorState.IDLE);
+    }
+    return;
+  }
   clearTimeout(recognitionRestartTimer);
   lastActivityTime = Date.now();
+  resetInterimState(); // Сбрасываем перед каждым стартом
+
   recognition = new webkitSpeechRecognition();
   recognition.lang = currentLang;
   recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.targetElement = targetElement; // Сохраняем цель
+  recognition.interimResults = settings.interimResultsEnabled;
+  recognition.targetElement = targetElement;
+  targetElement.recognitionInstance = recognition;
 
   recognition.onstart = () => {
-    if (recognition !== recognition.targetElement.recognitionInstance) return; // Старый инстанс
-    isRecognitionActuallyRunning = true;
-    lastActivityTime = Date.now();
-    updateIndicatorState(IndicatorState.LISTENING, targetElement);
+    if (recognition !== targetElement.recognitionInstance) return;
+    isRecognitionActuallyRunning = true; lastActivityTime = Date.now();
+    updateIndicatorState(isPromptGeneratorModeActive ? IndicatorState.PROMPT_COLLECTING : IndicatorState.LISTENING, targetElement);
   };
-  targetElement.recognitionInstance = recognition; // Привязываем инстанс к элементу
 
   recognition.onresult = (event) => {
     if (!isRecognitionActuallyRunning || recognition !== targetElement.recognitionInstance) return;
     lastActivityTime = Date.now();
-    let finalTranscript = '';
+    let accumulatedFinalTranscript = '';
+    let currentFullInterim = ""; // Собирает ПОЛНЫЙ interim для текущего event
+
     for (let i = event.resultIndex; i < event.results.length; ++i) {
-      if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript;
+        const result = event.results[i];
+        // Собираем все части текущего interim
+        if (!result.isFinal && settings.interimResultsEnabled) {
+            for (let j = 0; j < result.length; j++) { // Обычно одна альтернатива
+                 currentFullInterim += result[j].transcript;
+            }
+        }
+        // Собираем все финальные части
+        if (result.isFinal) {
+            accumulatedFinalTranscript += result[0].transcript;
+        }
     }
-    if (finalTranscript.trim()) {
-      if (isProcessingTranscript) {
-        transcriptQueue.push({ text: finalTranscript.trim(), target: targetElement });
+
+    const hasFinalInThisEvent = accumulatedFinalTranscript.trim().length > 0;
+
+    // Отображаем interim, только если он есть, включен, пользователь не редактировал И НЕТ ФИНАЛЬНОГО в этом же событии
+    if (settings.interimResultsEnabled && currentFullInterim.trim() && !hasUserEditedDuringInterim && !hasFinalInThisEvent) {
+      if (!isPromptGeneratorModeActive) {
+        if (!isDisplayingInterim) { // Начало новой interim фразы
+          interimPhraseStartPosition = getSelectionStart(targetElement);
+          isDisplayingInterim = true;
+        }
+        // Заменяем текст только если новый полный interim отличается от сохраненного
+        if (currentFullInterim !== currentInterimText) {
+            replaceTextRange(targetElement, interimPhraseStartPosition, interimPhraseStartPosition + currentInterimText.length, currentFullInterim);
+            currentInterimText = currentFullInterim; // Сохраняем новый полный interim
+            setCursorPosition(targetElement, interimPhraseStartPosition + currentInterimText.length);
+            triggerInputEvents(targetElement);
+        }
+      }
+    }
+
+    if (hasFinalInThisEvent) {
+      const rawFinalText = accumulatedFinalTranscript.trim();
+      if (isPromptGeneratorModeActive) {
+        collectedPromptIdeas += rawFinalText + " ";
+        // В режиме сбора идей, interim не отображается, поэтому нечего сбрасывать специально для final
+        // resetInterimState(); // Не нужно здесь, т.к. interim не должен влиять на сбор
       } else {
-        if (document.body.contains(targetElement) && isEditable(targetElement)) {
-            processFinalTranscript(finalTranscript.trim(), targetElement);
+        const wasDisplayingInterimPrior = isDisplayingInterim;
+        const userHadEditedPrior = hasUserEditedDuringInterim;
+        const savedInterimStartPrior = interimPhraseStartPosition;
+        const savedInterimLengthPrior = currentInterimText.length;
+
+        resetInterimState(); // Сбрасываем состояние interim ПЕРЕД обработкой final
+
+        const isReplacingCurrentInterim = settings.interimResultsEnabled && wasDisplayingInterimPrior && !userHadEditedPrior;
+
+        if (isProcessingTranscript) {
+            transcriptQueue.push({ text: rawFinalText, target: targetElement, userHasEdited: userHadEditedPrior, isReplacingInterim: isReplacingCurrentInterim, replaceStart: savedInterimStartPrior, replaceLength: savedInterimLengthPrior });
+        } else {
+            processFinalTranscript(rawFinalText, targetElement, userHadEditedPrior, isReplacingCurrentInterim, savedInterimStartPrior, savedInterimLengthPrior);
         }
       }
     }
@@ -327,233 +462,357 @@ function startRecognition(targetElement) {
 
   recognition.onerror = (event) => {
     if (recognition !== targetElement.recognitionInstance) return;
-    console.error(`Recognition.onerror: ${event.error}`, event.message);
-    recognition.errorObject = event.error; // Для onend
+    console.error(`SVI: Recognition.onerror: ${event.error}`, event.message);
+    recognition.errorObject = event.error;
+    if (settings.interimResultsEnabled || !isPromptGeneratorModeActive) resetInterimState();
+    let msgState = IndicatorState.RECOGNITION_ERROR;
+    if (event.error === 'no-speech') return;
     if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-      isDictationGloballyActive = false; settings.dictationActive = false;
+      msgState = IndicatorState.NO_MIC_ACCESS; isDictationGloballyActive = false; settings.dictationActive = false;
       chrome.storage.sync.set({ dictationActive: false });
-      stopRecognition(); // Останавливаем полностью
+      chrome.runtime.sendMessage({ command: "micPermissionDenied", site: window.location.hostname });
+      stopRecognition(); return;
     }
-    // onend обработает перезапуск или полную остановку и обновление индикатора
+    updateIndicatorState(msgState, targetElement, true);
   };
 
   recognition.onend = () => {
-    if (recognition !== targetElement.recognitionInstance && targetElement.recognitionInstance !== undefined) { // undefined если stopRecognition уже обнулил
-        // console.log("onend from an old/stopped instance for target:", targetElement); // DEBUG
-        // Если индикатор был для этого элемента, но инстанс уже не тот, убираем
-        if (indicatorElement && indicatorElement.targetElement === targetElement && currentIndicatorState !== IndicatorState.IDLE) {
-            updateIndicatorState(IndicatorState.IDLE);
-        }
-        return;
-    }
+    if (targetElement.recognitionInstance && recognition !== targetElement.recognitionInstance) return;
+    const wasRunning = isRecognitionActuallyRunning; isRecognitionActuallyRunning = false;
+    if (targetElement.recognitionInstance === recognition) targetElement.recognitionInstance = undefined;
     
-    const wasRunning = isRecognitionActuallyRunning;
-    isRecognitionActuallyRunning = false;
-    targetElement.recognitionInstance = undefined; // Отвязываем инстанс
+    const oldInterimWasDisplaying = isDisplayingInterim;
+    const oldInterimText = currentInterimText;
+    const oldInterimStart = interimPhraseStartPosition;
+    const oldUserHadEdited = hasUserEditedDuringInterim;
 
     const lastError = recognition ? recognition.errorObject : null;
+    if (settings.interimResultsEnabled || !isPromptGeneratorModeActive) resetInterimState();
 
-    if (isDictationGloballyActive && wasRunning &&
-        (!lastError || (lastError !== 'not-allowed' && lastError !== 'service-not-allowed')) &&
-        currentFocusedInput === targetElement && document.body.contains(targetElement) && isEditable(targetElement)) {
+    if (isPromptGeneratorModeActive) {
+        sendCollectedPromptIdeas(); // Отправляем идеи, если они есть
+    } else {
+        // Финализация "зависшего" interim, если interim включены
+        if (settings.interimResultsEnabled && oldInterimWasDisplaying && oldInterimText.trim() && !oldUserHadEdited && !lastError) {
+            if (isProcessingTranscript) {
+                transcriptQueue.push({ text: oldInterimText, target: targetElement, userHasEdited: false, isReplacingInterim: true, replaceStart: oldInterimStart, replaceLength: oldInterimText.length });
+            } else {
+                processFinalTranscript(oldInterimText, targetElement, false, true, oldInterimStart, oldInterimText.length);
+            }
+        }
+    }
+    
+    if ((isDictationGloballyActive || isPromptGeneratorModeActive) && wasRunning && (!lastError || (lastError !== 'not-allowed' && lastError !== 'service-not-allowed')) &&
+        currentFocusedInput === targetElement && document.activeElement === targetElement && document.body.contains(targetElement) &&
+        isEditable(targetElement) && !(isOnBlacklist(window.location.href) && !isPromptGeneratorModeActive) ) {
       if (Date.now() - lastActivityTime < RECOGNITION_TIMEOUT_MS) {
         recognitionRestartTimer = setTimeout(() => {
-          if (isDictationGloballyActive && currentFocusedInput === targetElement &&
-              document.activeElement === targetElement && !isRecognitionActuallyRunning) {
-            startRecognition(targetElement);
-          } else { updateIndicatorState(IndicatorState.IDLE); }
+          if (shouldStartRecognitionFor(targetElement) && document.activeElement === targetElement) startRecognition(targetElement);
+          else updateIndicatorState(IndicatorState.IDLE);
         }, RESTART_DELAY_MS);
-      } else { updateIndicatorState(IndicatorState.IDLE); /* console.log("Recognition timed out."); */ } // DEBUG
+      } else updateIndicatorState(IndicatorState.IDLE);
     } else {
-      updateIndicatorState(IndicatorState.IDLE);
-      // console.log(`Not restarting. Global: ${isDictationGloballyActive}, WasRun: ${wasRunning}, Err: ${lastError}, Focus: ${currentFocusedInput === targetElement}`); // DEBUG
+      if (currentIndicatorState !== IndicatorState.NO_MIC_ACCESS && currentIndicatorState !== IndicatorState.RECOGNITION_ERROR &&
+          currentIndicatorState !== IndicatorState.BLACKLISTED && currentIndicatorState !== IndicatorState.PASSWORD_FIELD) {
+        updateIndicatorState(IndicatorState.IDLE);
+      }
     }
-    if (recognition === targetElement.recognitionInstance) recognition = null; // Обнуляем глобальный, если это был он
+    if (recognition && recognition.targetElement === targetElement) recognition = null;
   };
 
   try { recognition.start(); }
   catch (e) {
-    console.error("Failed to start recognition (exception):", e);
-    isRecognitionActuallyRunning = false; updateIndicatorState(IndicatorState.IDLE);
-    if (recognition === targetElement.recognitionInstance) recognition = null;
-    targetElement.recognitionInstance = undefined;
+    console.error("SVI: Failed to call recognition.start():", e); isRecognitionActuallyRunning = false;
+    if (targetElement.recognitionInstance === recognition) targetElement.recognitionInstance = undefined;
+    recognition = null; if (settings.interimResultsEnabled || !isPromptGeneratorModeActive) resetInterimState();
+    if (e.name !== 'InvalidStateError') updateIndicatorState(IndicatorState.RECOGNITION_ERROR, targetElement, true);
+    else updateIndicatorState(IndicatorState.IDLE);
   }
 }
 
 function stopRecognition(callback) {
   clearTimeout(recognitionRestartTimer);
-  const recToStop = recognition;
-  const targetOfRecToStop = recToStop ? recToStop.targetElement : null;
+  const recToStop = recognition; const targetOfRecToStop = recToStop ? recToStop.targetElement : null;
+  
+  sendCollectedPromptIdeas(); // Отправляем идеи, если они есть, перед остановкой
 
-  isRecognitionActuallyRunning = false; // Сразу
-  if (recToStop) {
-      recToStop.onstart = null; recToStop.onresult = null; recToStop.onerror = null; recToStop.onend = null;
-      try { recToStop.abort(); } catch (e) { /* console.warn("Error aborting:", e); */ } // DEBUG
-      if (targetOfRecToStop) targetOfRecToStop.recognitionInstance = undefined;
+  isRecognitionActuallyRunning = false; recognition = null; 
+  if (settings.interimResultsEnabled || !isPromptGeneratorModeActive) {
+    resetInterimState();
   }
-  recognition = null; // Обнуляем глобальную ссылку
-  updateIndicatorState(IndicatorState.IDLE); // Скрываем индикатор
-  if (callback) setTimeout(callback, RESTART_DELAY_MS / 2);
+  if (recToStop) {
+    recToStop.onstart = null; recToStop.onresult = null; recToStop.onerror = null; recToStop.onend = null;
+    try { recToStop.abort(); } catch (e) {}
+    if (targetOfRecToStop && targetOfRecToStop.recognitionInstance === recToStop) targetOfRecToStop.recognitionInstance = undefined;
+  }
+  if (currentIndicatorState !== IndicatorState.NO_MIC_ACCESS) updateIndicatorState(IndicatorState.IDLE);
+  if (callback) setTimeout(callback, USER_EDIT_RESTART_DELAY_MS / 2);
 }
 
+function resetInterimState() {
+    const targetWithListener = (settings.interimResultsEnabled && isDisplayingInterim) ? currentFocusedInput : null;
+    isDisplayingInterim = false; currentInterimText = ''; interimPhraseStartPosition = null; hasUserEditedDuringInterim = false;
+    if(targetWithListener && typeof targetWithListener.removeEventListener === 'function') {
+        targetWithListener.removeEventListener('input', handleUserInputDuringInterim);
+    }
+    // collectedPromptIdeas здесь не очищаем, это делается в других местах
+}
 
-// --- Индикатор состояния ---
+function getSelectionStart(element) {
+    if (!element) return 0;
+    try {
+        if (typeof element.selectionStart === 'number') return element.selectionStart;
+        if (element.isContentEditable) {
+            const selection = window.getSelection();
+            if (selection && selection.rangeCount > 0) {
+                const range = selection.getRangeAt(0); const preSelectionRange = range.cloneRange();
+                preSelectionRange.selectNodeContents(element); preSelectionRange.setEnd(range.startContainer, range.startOffset);
+                return preSelectionRange.toString().length;
+            }
+        }
+    } catch (e) { console.warn("SVI: Error in getSelectionStart", e); }
+    return element.value ? element.value.length : (element.textContent ? element.textContent.length : 0);
+}
+
+function setCursorPosition(element, position) {
+    if (!element) return;
+    try {
+        if (typeof element.selectionStart === 'number') {
+            element.selectionStart = element.selectionEnd = position;
+        } else if (element.isContentEditable) {
+            element.focus(); const selection = window.getSelection(); if (!selection) return;
+            const range = document.createRange(); let charCount = 0; let foundNode = null; let foundOffset = 0;
+            function findTextNodeAndOffset(parentNode) {
+                for (let i = 0; i < parentNode.childNodes.length; i++) {
+                    const node = parentNode.childNodes[i];
+                    if (node.nodeType === Node.TEXT_NODE) {
+                        const nextCharCount = charCount + node.length;
+                        if (position <= nextCharCount) { foundNode = node; foundOffset = position - charCount; return true; }
+                        charCount = nextCharCount;
+                    } else if (node.nodeType === Node.ELEMENT_NODE) { if (findTextNodeAndOffset(node)) return true; }
+                } return false;
+            }
+            if (findTextNodeAndOffset(element)) {
+                range.setStart(foundNode, Math.min(foundOffset, foundNode.length));
+                range.collapse(true); selection.removeAllRanges(); selection.addRange(range);
+            } else { range.selectNodeContents(element); range.collapse(false); selection.removeAllRanges(); selection.addRange(range); }
+        }
+    } catch (e) { console.warn("SVI: Error setting cursor position", e); }
+}
+
+function replaceTextRange(element, start, end, newText) {
+    if (!element) return;
+    if (element.isContentEditable) {
+        element.focus(); const selection = window.getSelection(); if (!selection) return;
+        const range = document.createRange(); let charCount = 0;
+        let startNode = null, startOffset = 0, endNode = null, endOffset = 0;
+        function findNodeAndOffsetForRange(parentNode, targetPosition, assignCallback) {
+            for (let i = 0; i < parentNode.childNodes.length; i++) {
+                const node = parentNode.childNodes[i];
+                if (node.nodeType === Node.TEXT_NODE) {
+                    const nodeLength = node.length;
+                    if (charCount <= targetPosition && targetPosition <= charCount + nodeLength) {
+                         assignCallback(node, targetPosition - charCount); return true;
+                    }
+                    charCount += nodeLength;
+                } else if (node.nodeType === Node.ELEMENT_NODE) {
+                    if (findNodeAndOffsetForRange(node, targetPosition, assignCallback)) return true;
+                }
+            } return false;
+        }
+        charCount = 0;
+        if (!findNodeAndOffsetForRange(element, start, (node, offset) => { startNode = node; startOffset = offset; })) {
+            startNode = element; startOffset = 0;
+            if(element.firstChild && start === 0) {
+                let node = element.firstChild;
+                while(node && node.firstChild && node.nodeType !== Node.TEXT_NODE) node = node.firstChild;
+                if(node && node.nodeType === Node.TEXT_NODE) startNode = node; else startNode = element;
+            } else if (element.childNodes.length > 0 && start > 0) {
+                startNode = element.lastChild || element;
+                startOffset = startNode.nodeType === Node.TEXT_NODE ? (startNode.nodeValue? startNode.nodeValue.length : 0) : (startNode.childNodes ? startNode.childNodes.length : 0);
+            }
+        }
+        charCount = 0;
+        if (!findNodeAndOffsetForRange(element, end, (node, offset) => { endNode = node; endOffset = offset; })) {
+            endNode = startNode;
+            endOffset = (startNode && startNode.nodeType === Node.TEXT_NODE) ? (startNode.nodeValue? startNode.nodeValue.length : 0) : (startNode ? (startNode.childNodes ? startNode.childNodes.length : 0) : 0);
+            if(startNode === element && end > startOffset) endOffset = element.childNodes.length;
+             if (startNode && startNode.nodeType === Node.TEXT_NODE && end > startOffset) endOffset = (startNode.nodeValue? startNode.nodeValue.length : 0);
+        }
+
+        try {
+            startOffset = Math.min(startOffset, startNode.nodeValue ? startNode.nodeValue.length : (startNode.childNodes ? startNode.childNodes.length : 0) );
+            endOffset = Math.min(endOffset, endNode.nodeValue ? endNode.nodeValue.length : (endNode.childNodes ? endNode.childNodes.length : 0) );
+            if (startNode === endNode && startOffset > endOffset) startOffset = endOffset;
+
+            range.setStart(startNode, startOffset);
+            range.setEnd(endNode, endOffset);
+            selection.removeAllRanges();
+            selection.addRange(range);
+            document.execCommand('insertText', false, newText);
+        } catch (e) {
+             console.warn("SVI: Error replacing contentEditable range.", e, {start, end, newText, sn:startNode, so:startOffset, en:endNode, eo:endOffset});
+             document.execCommand('insertText', false, newText);
+        }
+    } else if (typeof element.selectionStart === 'number') {
+        const currentVal = element.value;
+        const scrollTop = element.scrollTop;
+        element.value = currentVal.substring(0, start) + newText + currentVal.substring(end);
+        element.scrollTop = scrollTop;
+    }
+}
+
 function createIndicator() {
     if (document.getElementById(INDICATOR_ID)) {
-        indicatorElement = document.getElementById(INDICATOR_ID);
-        return;
+        indicatorElement = document.getElementById(INDICATOR_ID); return;
     }
-    indicatorElement = document.createElement('div');
-    indicatorElement.id = INDICATOR_ID;
+    indicatorElement = document.createElement('div'); indicatorElement.id = INDICATOR_ID;
     Object.assign(indicatorElement.style, {
         position: 'fixed', zIndex: '2147483647', padding: '2px 6px',
         backgroundColor: 'rgba(0, 0, 0, 0.7)', color: '#fff', fontSize: '12px',
         borderRadius: '4px', fontFamily: 'system-ui, sans-serif', pointerEvents: 'none',
         visibility: 'hidden', lineHeight: '1.2', whiteSpace: 'nowrap',
-        transition: 'opacity 0.2s ease-in-out, background-color 0.2s ease-in-out' // Плавность
+        transition: 'opacity 0.2s ease-in-out, background-color 0.2s ease-in-out, transform 0.1s ease-out'
     });
-    document.body.appendChild(indicatorElement);
+    if (document.body) { document.body.appendChild(indicatorElement); }
+    else { document.addEventListener('DOMContentLoaded', () => { if (!document.getElementById(INDICATOR_ID) && document.body) document.body.appendChild(indicatorElement); }); }
 }
 
-function updateIndicatorState(newState, targetForPositioning = null) {
-    if (!indicatorElement) createIndicator();
-    if (!indicatorElement) return;
-
-    clearTimeout(indicatorUpdateTimer); // Останавливаем предыдущую анимацию точек
-    currentIndicatorState = newState;
-    indicatorElement.targetElement = targetForPositioning || currentFocusedInput; // Привязываем к цели для позиционирования
-
-    let text = '';
-    let bgColor = 'rgba(0, 0, 0, 0.7)';
-
+function updateIndicatorState(newState, targetForPositioning = null, temporaryMessage = false) {
+    if (!document.body) { if (newState !== IndicatorState.IDLE) console.warn("SVI: Indicator update before body. State:", newState); return; }
+    if (!indicatorElement) createIndicator(); if (!indicatorElement) return;
+    clearTimeout(indicatorUpdateTimer); clearTimeout(temporaryIndicatorClearTimer);
+    const effectiveTarget = targetForPositioning || currentFocusedInput || indicatorElement.targetElement;
+    indicatorElement.targetElement = effectiveTarget; currentIndicatorState = newState;
+    let text = ''; let bgColor = 'rgba(0, 0, 0, 0.7)'; let textColor = '#fff';
     switch (newState) {
-        case IndicatorState.IDLE:
-            indicatorElement.style.visibility = 'hidden';
-            indicatorElement.style.opacity = '0';
-            return;
-        case IndicatorState.LISTENING:
-            text = "Слушаю"; // 🎤
-            bgColor = 'rgba(0, 128, 0, 0.7)'; // Зеленый
-            animateDots(text);
-            break;
-        case IndicatorState.PROCESSING:
-            text = "Обработка"; // ⚙️
-            bgColor = 'rgba(255, 165, 0, 0.8)'; // Оранжевый
-            animateDots(text);
-            break;
-        case IndicatorState.TRANSLATING:
-            text = "Перевод"; // 🌍
-            bgColor = 'rgba(0, 100, 255, 0.8)'; // Синий
-            animateDots(text);
-            break;
-        default:
-            indicatorElement.style.visibility = 'hidden';
-            indicatorElement.style.opacity = '0';
-            return;
+        case IndicatorState.IDLE: indicatorElement.style.opacity = '0'; setTimeout(() => { if (currentIndicatorState === IndicatorState.IDLE) indicatorElement.style.visibility = 'hidden'; }, 200); return;
+        case IndicatorState.LISTENING: text = "Слушаю"; bgColor = 'rgba(0, 128, 0, 0.75)'; animateDots(text); break;
+        case IndicatorState.PROCESSING: text = "Обработка"; bgColor = 'rgba(255, 165, 0, 0.8)'; animateDots(text); break;
+        case IndicatorState.TRANSLATING: text = "Перевод"; bgColor = 'rgba(0, 100, 255, 0.8)'; animateDots(text); break;
+        case IndicatorState.PROMPT_COLLECTING: text = "Идеи для промпта..."; bgColor = 'rgba(128, 0, 128, 0.75)'; animateDots(text); break;
+        case IndicatorState.BLACKLISTED: text = "Сайт в черном списке"; bgColor = 'rgba(100, 100, 100, 0.8)'; textColor = '#eee'; break;
+        case IndicatorState.NO_MIC_ACCESS: text = "Нет доступа к микрофону"; bgColor = 'rgba(220, 50, 50, 0.85)'; break;
+        case IndicatorState.PASSWORD_FIELD: text = "На полях паролей не работает"; bgColor = 'rgba(100, 100, 100, 0.8)'; textColor = '#eee'; break;
+        case IndicatorState.RECOGNITION_ERROR: text = "Ошибка распознавания"; bgColor = 'rgba(255, 100, 0, 0.85)'; break;
+        default: indicatorElement.style.visibility = 'hidden'; indicatorElement.style.opacity = '0'; return;
     }
-
-    indicatorElement.style.backgroundColor = bgColor;
-    indicatorElement.style.visibility = 'visible';
-    indicatorElement.style.opacity = '1';
+    indicatorElement.textContent = text; indicatorElement.style.backgroundColor = bgColor; indicatorElement.style.color = textColor;
+    indicatorElement.style.visibility = 'visible'; indicatorElement.style.opacity = '1';
+    if (newState !== IndicatorState.LISTENING && newState !== IndicatorState.PROCESSING && newState !== IndicatorState.TRANSLATING && newState !== IndicatorState.PROMPT_COLLECTING) {
+        indicatorElement.textContent = text;
+    }
     positionIndicator();
+    if (temporaryMessage) {
+        temporaryIndicatorClearTimer = setTimeout(() => {
+            if (currentIndicatorState === newState && (newState === IndicatorState.BLACKLISTED || newState === IndicatorState.PASSWORD_FIELD || newState === IndicatorState.RECOGNITION_ERROR) && newState !== IndicatorState.NO_MIC_ACCESS) {
+                updateIndicatorState(IndicatorState.IDLE);
+            }
+        }, 3000);
+    }
 }
 
 function animateDots(baseText) {
-    if (!indicatorElement || currentIndicatorState === IndicatorState.IDLE) return;
-    dotCount = (dotCount + 1) % 4; // <--- ИСПОЛЬЗОВАНИЕ dotCount
-    indicatorElement.textContent = baseText + '.'.repeat(dotCount); // <--- ИСПОЛЬЗОВАНИЕ dotCount
+    if (!indicatorElement ||
+        (currentIndicatorState !== IndicatorState.LISTENING &&
+         currentIndicatorState !== IndicatorState.PROCESSING &&
+         currentIndicatorState !== IndicatorState.TRANSLATING &&
+         currentIndicatorState !== IndicatorState.PROMPT_COLLECTING)
+       ) {
+        clearTimeout(indicatorUpdateTimer); return;
+    }
+    dotCount = (dotCount + 1) % 4; indicatorElement.textContent = baseText + '.'.repeat(dotCount);
     indicatorUpdateTimer = setTimeout(() => animateDots(baseText), 350);
 }
 
-
 function positionIndicator(checkFocusAndVisibility = false) {
     if (!indicatorElement || indicatorElement.style.visibility === 'hidden') return;
-
     const target = indicatorElement.targetElement;
-    if (!target || !document.body.contains(target)) {
-        updateIndicatorState(IndicatorState.IDLE); return;
-    }
-
-    if (checkFocusAndVisibility) {
-        const style = window.getComputedStyle(target);
-        if (document.activeElement !== target || style.display === 'none' || style.visibility === 'hidden') {
+    if (!target || !document.body || !document.body.contains(target)) { updateIndicatorState(IndicatorState.IDLE); return; }
+    if (checkFocusAndVisibility && document.activeElement !== target) {
+        if (currentIndicatorState === IndicatorState.LISTENING || currentIndicatorState === IndicatorState.PROCESSING ||
+            currentIndicatorState === IndicatorState.TRANSLATING || currentIndicatorState === IndicatorState.PROMPT_COLLECTING) {
             updateIndicatorState(IndicatorState.IDLE); return;
         }
     }
-
     const rect = target.getBoundingClientRect();
-    let top = rect.top + (rect.height / 2) - (indicatorElement.offsetHeight / 2);
+    let top = rect.top - indicatorElement.offsetHeight - 3; // Позиция индикатора
     let left = rect.left + 5;
-
-    if (rect.width < (indicatorElement.offsetWidth + 15)) { // Если поле узкое
-        left = rect.left - indicatorElement.offsetWidth - 5;
-        if (left < 5) left = rect.right + 5;
+    const safetyMargin = 3;
+    if (top < safetyMargin) top = safetyMargin;
+    if (left + indicatorElement.offsetWidth > rect.right - 5 && rect.width > indicatorElement.offsetWidth + 10) {}
+    else if (rect.width < indicatorElement.offsetWidth + 10) {
+        left = rect.left - indicatorElement.offsetWidth - 5; if (left < safetyMargin) left = rect.right + 5;
     }
-
-    // Коррекция выхода за экран
-    if (left < 5) left = 5;
-    if (top < 5) top = 5;
-    if (left + indicatorElement.offsetWidth > window.innerWidth - 5) {
-      left = window.innerWidth - indicatorElement.offsetWidth - 5;
-    }
-    if (top + indicatorElement.offsetHeight > window.innerHeight - 5) {
-      top = window.innerHeight - indicatorElement.offsetHeight - 5;
-    }
-
-    indicatorElement.style.top = `${Math.round(top)}px`;
-    indicatorElement.style.left = `${Math.round(left)}px`;
+    if (left < safetyMargin) left = safetyMargin;
+    if (left + indicatorElement.offsetWidth > window.innerWidth - safetyMargin) left = window.innerWidth - indicatorElement.offsetWidth - safetyMargin;
+    if (top + indicatorElement.offsetHeight > window.innerHeight - safetyMargin) top = window.innerHeight - indicatorElement.offsetHeight - safetyMargin;
+    indicatorElement.style.top = `${Math.round(top)}px`; indicatorElement.style.left = `${Math.round(left)}px`;
 }
 
-
-// --- Обработка и вставка текста ---
-async function processFinalTranscript(text, targetElement) {
+async function processFinalTranscript(rawFinalText, targetElement, userHasEdited, isReplacingInterim, replaceStartPos = 0, replaceLength = 0) {
   if (!targetElement || !document.body.contains(targetElement) || !isEditable(targetElement)) {
-    isProcessingTranscript = false; // Сброс, если начато, но цель невалидна
-    updateIndicatorState(IndicatorState.IDLE); // Гарантированно скрыть индикатор
+    isProcessingTranscript = false;
+    if (isRecognitionActuallyRunning && recognition && recognition.targetElement === targetElement) updateIndicatorState(isPromptGeneratorModeActive ? IndicatorState.PROMPT_COLLECTING : IndicatorState.LISTENING, targetElement);
+    else updateIndicatorState(IndicatorState.IDLE);
     return;
   }
-
   isProcessingTranscript = true;
-  updateIndicatorState(IndicatorState.PROCESSING, targetElement);
+  if (!isReplacingInterim || settings.translationActive) {
+      updateIndicatorState(IndicatorState.PROCESSING, targetElement);
+  }
 
   try {
-    let processedText = text;
-    const commandProcessed = processFormattingCommands(processedText.toLowerCase(), targetElement);
-    if (commandProcessed) { return; } // finally сбросит флаг и обновит индикатор
+    let textForProcessing = rawFinalText;
+    if (settings.disableBrowserAutoPunctuation) {
+        textForProcessing = textForProcessing.replace(/(?<!\w)[.,!?;:"](?!\w)/g, '').replace(/[.,!?;:"]\s*$/,'');
+    }
 
-    processedText = applyAutoReplace(processedText);
+    let textAfterAutoreplace = applyAutoReplace(textForProcessing);
+    let textToInsert = textAfterAutoreplace;
 
-    if (settings.translationActive && settings.geminiApiKey && processedText.trim()) {
+    const commandProcessed = processFormattingCommands(textAfterAutoreplace.toLowerCase(), targetElement, isReplacingInterim, replaceStartPos, replaceLength);
+
+    if (commandProcessed) {
+        if (["удалить слово", "удалить всё", "стереть всё"].includes(textAfterAutoreplace.toLowerCase())) { textToInsert = ""; }
+        else if (["новая строка", "новый абзац", "абзац"].includes(textAfterAutoreplace.toLowerCase())) { textToInsert = ""; }
+    }
+
+    if (settings.translationActive && settings.geminiApiKey && textToInsert.trim()) {
       updateIndicatorState(IndicatorState.TRANSLATING, targetElement);
       try {
-        processedText = await translateTextGemini(processedText, settings.dictationLang, settings.translationLang, settings.geminiApiKey);
-      } catch (error) { console.error("Translation error in pipeline:", error.message); }
-      // После перевода (или ошибки) индикатор вернется к LISTENING, если распознавание еще идет,
-      // или IDLE, если это была последняя операция. Это обработает onend.
+        const translatedText = await translateTextViaBackground(textToInsert, settings.dictationLang, settings.translationLang, settings.geminiApiKey,
+                                                                (settings.geminiModel === 'custom' && settings.customGeminiModel) ? settings.customGeminiModel : settings.geminiModel);
+        if (translatedText && translatedText.trim() && translatedText.toLowerCase() !== textToInsert.toLowerCase()) {
+            textToInsert = translatedText;
+        }
+      } catch (error) { console.error("SVI: Translation error in final pipeline:", error.message); }
     }
 
-    if (processedText.trim()) {
-      if (document.activeElement === targetElement) {
-          insertText(targetElement, processedText + ' ');
-      } else if (currentFocusedInput && isEditable(currentFocusedInput) && document.activeElement === currentFocusedInput) {
-          insertText(currentFocusedInput, processedText + ' ');
-      }
+    if (!commandProcessed && textToInsert.trim()) {
+        if (isReplacingInterim && settings.interimResultsEnabled) {
+            replaceTextRange(targetElement, replaceStartPos, replaceStartPos + replaceLength, textToInsert + ' ');
+            setCursorPosition(targetElement, replaceStartPos + textToInsert.length + 1);
+        } else {
+            if (document.activeElement === targetElement) insertText(targetElement, textToInsert + ' ');
+            else if (currentFocusedInput && isEditable(currentFocusedInput) && document.activeElement === currentFocusedInput) {
+                insertText(currentFocusedInput, textToInsert + ' ');
+            }
+        }
+        triggerInputEvents(targetElement);
+    } else if (commandProcessed) {
+        triggerInputEvents(targetElement);
     }
+
   } catch (e) {
-      console.error("Error in processFinalTranscript pipeline:", e);
+      console.error("SVI: Error in processFinalTranscript final pipeline:", e);
   } finally {
     isProcessingTranscript = false;
-    // Если распознавание все еще должно быть активно для этого элемента, возвращаем индикатор в LISTENING.
-    // Иначе onend сам переведет в IDLE.
-    if (isRecognitionActuallyRunning && recognition && recognition.targetElement === targetElement) {
-        updateIndicatorState(IndicatorState.LISTENING, targetElement);
-    } else if (currentIndicatorState !== IndicatorState.IDLE) { // Если не слушаем, но и не IDLE, значит обработка завершена
-        updateIndicatorState(IndicatorState.IDLE);
-    }
-
+    if (isRecognitionActuallyRunning && recognition && recognition.targetElement === targetElement) updateIndicatorState(isPromptGeneratorModeActive ? IndicatorState.PROMPT_COLLECTING : IndicatorState.LISTENING, targetElement);
+    else if (currentIndicatorState !== IndicatorState.IDLE && currentIndicatorState !== IndicatorState.NO_MIC_ACCESS) updateIndicatorState(IndicatorState.IDLE);
     if (transcriptQueue.length > 0) {
         const nextJob = transcriptQueue.shift();
-        setTimeout(() => processFinalTranscript(nextJob.text, nextJob.target), 0);
+        processFinalTranscript(nextJob.text, nextJob.target, nextJob.userHasEdited, nextJob.isReplacingInterim, nextJob.replaceStart, nextJob.replaceLength);
     }
   }
 }
@@ -564,85 +823,104 @@ function applyAutoReplace(text) {
   parsedAutoReplaceRules.forEach(rule => { resultText = resultText.replace(rule.regex, rule.value); });
   return resultText;
 }
-function processFormattingCommands(textLC, targetElement) {
-  const commands = {
-    "удалить слово": () => deleteLastWord(targetElement), "удалить всё": () => clearInput(targetElement),
-    "стереть всё": () => clearInput(targetElement), "новая строка": () => insertText(targetElement, '\n'),
-    "новый абзац": () => insertText(targetElement, '\n\n'), "абзац": () => insertText(targetElement, '\n\n')
-  };
-  if (commands[textLC]) { commands[textLC](); return true; } return false;
+
+function processFormattingCommands(textLC, targetElement, isReplacingInterim = false, interimStart = 0, interimLength = 0) {
+    const commands = {
+        "удалить слово": () => deleteLastWord(targetElement),
+        "удалить всё": () => clearInput(targetElement),
+        "стереть всё": () => clearInput(targetElement),
+        "новая строка": () => {
+            const textToInsertCmd = '\n';
+            if (isReplacingInterim && settings.interimResultsEnabled) replaceTextRange(targetElement, interimStart, interimStart + interimLength, textToInsertCmd);
+            else insertText(targetElement, textToInsertCmd);
+        },
+        "новый абзац": () => {
+            const textToInsertCmd = '\n\n';
+            if (isReplacingInterim && settings.interimResultsEnabled) replaceTextRange(targetElement, interimStart, interimStart + interimLength, textToInsertCmd);
+            else insertText(targetElement, textToInsertCmd);
+        },
+        "абзац": () => {
+            const textToInsertCmd = '\n\n';
+            if (isReplacingInterim && settings.interimResultsEnabled) replaceTextRange(targetElement, interimStart, interimStart + interimLength, textToInsertCmd);
+            else insertText(targetElement, textToInsertCmd);
+        }
+    };
+    if (commands[textLC]) {
+        commands[textLC]();
+        return true;
+    } return false;
 }
+
 function deleteLastWord(element) {
     const isContentEditable = element.isContentEditable;
-    if (isContentEditable) { // Упрощенная версия для contentEditable
-        document.execCommand('undo'); // Пытаемся отменить последнее действие (может удалить слово)
-                                      // Это не всегда "удалить слово", но часто ближайшее.
-                                      // Для более точного нужно сложное манипулирование Range.
-    } else {
-        let value = element.value; let selStart = element.selectionStart;
-        let textBefore = value.substring(0, selStart);
-        if (element.selectionStart !== element.selectionEnd) { // Если есть выделение, удаляем его
-            element.value = textBefore.substring(0, element.selectionStart) + value.substring(element.selectionEnd);
+    if (isContentEditable) { document.execCommand('undo'); }
+    else {
+        let value = element.value; let selStart = element.selectionStart; let textBefore = value.substring(0, selStart);
+        if (element.selectionStart !== element.selectionEnd) {
+            element.value = value.substring(0, element.selectionStart) + value.substring(element.selectionEnd);
             element.selectionStart = element.selectionEnd = element.selectionStart;
-        } else { // Нет выделения, удаляем слово перед курсором
-            const trimmedTextBefore = textBefore.trimEnd();
-            const lastSpace = trimmedTextBefore.lastIndexOf(' ');
+        } else {
+            const trimmedTextBefore = textBefore.trimEnd(); const lastSpace = trimmedTextBefore.lastIndexOf(' ');
             textBefore = (lastSpace !== -1) ? trimmedTextBefore.substring(0, lastSpace + 1) : '';
             element.value = textBefore + value.substring(selStart);
             element.selectionStart = element.selectionEnd = textBefore.length;
         }
     }
-    const event = new Event('input', { bubbles: true, cancelable: true }); element.dispatchEvent(event);
+    triggerInputEvents(element);
 }
+
 function clearInput(element) {
     if (element.isContentEditable) { element.innerHTML = ''; } else { element.value = ''; }
-    const event = new Event('input', { bubbles: true, cancelable: true }); element.dispatchEvent(event);
+    triggerInputEvents(element);
 }
+
 function insertText(element, textToInsert) {
-  if (!element || !document.body.contains(element)) return;
-  element.focus();
+  if (!element || !document.body || !document.body.contains(element)) return; element.focus();
   if (element.isContentEditable) { document.execCommand('insertText', false, textToInsert); }
   else if (typeof element.selectionStart === 'number') {
     const start = element.selectionStart, end = element.selectionEnd;
+    const scrollTop = element.scrollTop;
     element.value = element.value.substring(0, start) + textToInsert + element.value.substring(end);
     element.selectionStart = element.selectionEnd = start + textToInsert.length;
+    element.scrollTop = scrollTop;
   } else { element.value += textToInsert; }
-  const event = new Event('input', { bubbles: true, cancelable: true }); element.dispatchEvent(event);
+  triggerInputEvents(element);
 }
 
-// --- Интеграция с Gemini API ---
-async function translateTextGemini(text, sourceLang, targetLang, apiKey) {
-  if (!text.trim() || !apiKey) return Promise.resolve(text);
-  const modelToUse = (settings.geminiModel === 'custom' && settings.customGeminiModel) ? settings.customGeminiModel : settings.geminiModel;
-  const apiUrl = `${GEMINI_API_ENDPOINT_PREFIX}${modelToUse}${GEMINI_API_ENDPOINT_SUFFIX}${apiKey}`;
-  const prompt = `Translate from ${getLanguageNameForPrompt(sourceLang)} to ${getLanguageNameForPrompt(targetLang)}. Return ONLY the translated text.\nOriginal: "${text}"`;
-  try {
-    const response = await fetch(apiUrl, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-    });
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({ error: { message: "Failed to parse error" }}));
-      throw new Error(`Gemini API: ${response.status} ${errorData.error?.message || ''}`);
-    }
-    const data = await response.json();
-    if (data.candidates?.[0]?.content?.parts?.[0]?.text) return data.candidates[0].content.parts[0].text.trim();
-    if (data.promptFeedback?.blockReason) throw new Error(`Translation blocked: ${data.promptFeedback.blockReason}`);
-    throw new Error("Could not extract translated text.");
-  } catch (error) { console.error("Gemini API call error:", error); return text; } // Возврат исходного текста при ошибке
-}
-function getLanguageNameForPrompt(langCode) {
-  const lang = langCode.split('-')[0].toLowerCase();
-  switch (lang) {
-    case 'ru': return 'Russian'; case 'en': return 'English'; case 'de': return 'German';
-    case 'fr': return 'French'; case 'es': return 'Spanish'; default: return langCode;
-  }
+function translateTextViaBackground(text, sourceLang, targetLang, apiKey, model) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      {
+        command: "translateTextViaGemini",
+        textToTranslate: text,
+        sourceLang: sourceLang,
+        targetLang: targetLang,
+        apiKey: apiKey,
+        model: model
+      },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.error("SVI Content: Error sending translate message to background:", chrome.runtime.lastError.message);
+          reject(new Error(chrome.runtime.lastError.message));
+          return;
+        }
+        if (response) {
+          if (response.success && response.translatedText) {
+            resolve(response.translatedText);
+          } else {
+            console.error("SVI Content: Translation failed in background:", response.error);
+            resolve(text);
+          }
+        } else {
+          console.error("SVI Content: No response from background for translation.");
+          resolve(text);
+        }
+      }
+    );
+  });
 }
 
 // --- Запуск ---
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => setTimeout(loadSettingsAndInitialize, 150));
-} else {
-    setTimeout(loadSettingsAndInitialize, 150); // Небольшая задержка для SPA и тяжелых сайтов
-}
-// console.log("Content script (v2.2 - informative indicator) loaded."); // DEBUG
+    document.addEventListener('DOMContentLoaded', () => setTimeout(loadSettingsAndInitialize, 200));
+} else { setTimeout(loadSettingsAndInitialize, 200); }

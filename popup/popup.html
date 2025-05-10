@@ -1,12 +1,12 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Настройки Голосового Ввода Pro</title>
+  <title>Smart Voice Input - Настройки</title>
   <meta charset="UTF-8">
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
-      width: 350px; /* Увеличим ширину для новых настроек */
+      width: 380px; /* Немного увеличим ширину для нового раздела */
       padding: 15px;
       font-size: 14px;
       color: #333;
@@ -16,7 +16,7 @@
     label { display: flex; align-items: center; margin-bottom: 10px; cursor: pointer; }
     input[type="checkbox"] { margin-right: 8px; width: 16px; height: 16px; accent-color: #4CAF50; }
     input[type="text"],
-    input[type="password"], /* Для API ключа, чтобы маскировать ввод */
+    input[type="password"],
     select,
     textarea {
       margin-left: auto;
@@ -24,19 +24,30 @@
       border-radius: 4px;
       border: 1px solid #ccc;
       flex-grow: 1;
-      box-sizing: border-box; /* Чтобы padding не увеличивал общую ширину */
+      box-sizing: border-box;
     }
     textarea { min-height: 60px; resize: vertical; width: 100%; margin-left: 0;}
+    button {
+      padding: 6px 12px;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+      background-color: #f0f0f0;
+      cursor: pointer;
+      margin-top: 5px;
+    }
+    button:hover { background-color: #e0e0e0; }
     .container { display: flex; flex-direction: column; gap: 10px; }
-    .setting-group { margin-bottom: 15px; }
+    .setting-group { margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px dashed #ddd; }
+    .setting-group:last-child { border-bottom: none; }
     .info-text { font-size: 0.85em; color: #666; margin-top: -5px; margin-bottom:10px; }
     .label-textarea { flex-direction: column; align-items: flex-start; }
     .label-textarea span { margin-bottom: 5px; }
-    /* .hotkey-info была удалена, стили для нее больше не нужны */
+    .textarea-with-button { display: flex; flex-direction: column; }
+    .textarea-with-button button { align-self: flex-end; }
   </style>
 </head>
 <body>
-  <h4>Голосовой Ввод Pro - Настройки</h4>
+  <h4>Smart Voice Input - Настройки</h4>
 
   <div class="container">
     <!-- ОСНОВНЫЕ НАСТРОЙКИ -->
@@ -54,36 +65,53 @@
           <option value="de-DE">Deutsch</option>
           <option value="fr-FR">Français</option>
           <option value="es-ES">Español</option>
-          <!-- Добавьте другие языки по необходимости -->
         </select>
       </label>
-      <!-- Блок с информацией о горячей клавише удален -->
+      <label>
+        <input type="checkbox" id="disableBrowserAutoPunctuation"> Отключить авто-пунктуацию браузера
+      </label>
+      <p class="info-text">Рекомендуется, если используете голосовые команды для знаков препинания.</p>
+    </div>
+
+    <!-- ГЕНЕРАТОР ПРОМПТОВ -->
+    <div class="setting-group">
+      <h5>Генератор Промптов (AI)</h5>
+      <label>
+        <input type="checkbox" id="togglePromptGeneratorMode"> Включить режим "Генерация Промпта"
+      </label>
+      <p class="info-text">В этом режиме ваша речь будет использована для создания улучшенного промпта с помощью Gemini.</p>
+      <div class="textarea-with-button">
+        <textarea id="generatedPromptTextarea" rows="4" readonly placeholder="Здесь появится сгенерированный промпт..."></textarea>
+        <button id="copyPromptButton">Копировать промпт</button>
+      </div>
+      <label style="margin-top: 10px;">
+        <input type="checkbox" id="autoInsertGeneratedPrompt"> Вставлять промпт в поле при фокусе (текущая вкладка)
+      </label>
     </div>
 
     <!-- НАСТРОЙКИ ПЕРЕВОДА -->
     <div class="setting-group">
       <h5>Перевод (через Gemini API)</h5>
       <label>
-        <input type="checkbox" id="toggleTranslation"> Включить перевод
+        <input type="checkbox" id="toggleTranslation"> Включить перевод текста (после диктовки)
       </label>
       <label>
         Ваш Gemini API Ключ:
         <input type="password" id="geminiApiKey" placeholder="Введите ваш API ключ">
       </label>
-      <p class="info-text">Ключ сохраняется локально. <a href="https://aistudio.google.com/app/apikey" target="_blank">Получить ключ</a></p>
+      <p class="info-text">Ключ сохраняется локально. <a href="https://aistudio.google.com/app/apikey" target="_blank">Получить ключ</a> (Нужен для перевода и генератора промптов)</p>
       <label>
         Язык перевода:
-        <select id="translationLanguageSelect" disabled> <!-- Изначально выключен, включается с toggleTranslation -->
+        <select id="translationLanguageSelect" disabled>
           <option value="en">Английский</option>
           <option value="ru">Русский</option>
           <option value="de">Немецкий</option>
           <option value="fr">Французский</option>
           <option value="es">Испанский</option>
-          <!-- Добавьте другие языки -->
         </select>
       </label>
       <label>
-        Модель Gemini:
+        Модель Gemini для перевода/генерации:
         <select id="geminiModelSelect" disabled>
           <option value="gemini-1.5-flash-latest">Gemini 1.5 Flash (быстрая)</option>
           <option value="gemini-1.5-pro-latest">Gemini 1.5 Pro (качественная)</option>
@@ -100,24 +128,24 @@
     <div class="setting-group">
       <h5>Автозамена</h5>
       <label class="label-textarea">
-        <span>Правила автозамены (каждое правило на новой строке, формат: "фраза для замены" : "чем заменить"):</span>
+        <span>Правила автозамены (формат: "фраза" : "замена"):</span>
         <textarea id="autoReplaceRules" placeholder="например:
 вопросительный знак : ?
-новая строка : \n"></textarea>
+новая строка : \\n"></textarea>
       </label>
-      <p class="info-text">Используйте `\n` для новой строки. Регистр при поиске фразы для замены обычно игнорируется (зависит от реализации).</p>
+      <p class="info-text">Используйте `\\n` для новой строки.</p>
     </div>
 
     <!-- ЧЕРНЫЙ СПИСОК САЙТОВ -->
     <div class="setting-group">
       <h5>Черный список сайтов</h5>
       <label class="label-textarea">
-        <span>Домены (или части URL), где расширение не будет работать (каждый на новой строке):</span>
+        <span>Домены (или части URL), где расширение не будет работать:</span>
         <textarea id="blacklistSites" placeholder="например:
 example.com
 anothersite.org/path"></textarea>
       </label>
-      <p class="info-text">Расширение не будет активироваться на страницах, URL которых содержит указанные строки.</p>
+      <p class="info-text">Каждый на новой строке.</p>
     </div>
 
   </div>
